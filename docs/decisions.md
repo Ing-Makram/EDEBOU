@@ -1,0 +1,81 @@
+# Décisions
+
+- Backend Django 6.1 + DRF 3.18, SQLite, dossier `backend/` ; apps : `accounts`, `catalog`, `operations`.
+- Utilisateur personnalisé : identifiant = nom (unique) + PIN 4 à 6 chiffres, PIN stocké haché (champ `password`).
+- Connexion API par jeton DRF (`/api/auth/login/`), limitée à 10 essais/minute (PIN court, brute-force possible sur le Wi-Fi).
+- Rôles : `manager`, `cashier`, `delivery` ; Django admin retiré (inutile, l'interface est Flutter).
+- Montants en millimes : entiers (`BigIntegerField`), jamais de flottants.
+- Modèles d'historique (Sale, SaleLine, Payment, ConsignMovement, StockMovement) en ajout seul : `save()` sur une ligne existante et `delete()` lèvent une erreur ; correction = écriture inverse.
+- Stock en unités de base ; `ProductUnit.factor` convertit palette/pack → unités de base.
+- Prix par (unité de vente, type de client) dans `ProductPrice`, pas un prix de base × facteur (un pack n'est pas forcément 6× l'unité).
+- Consigne : `ProductUnit.consign_type` + `consign_qty` = nombre d'articles consignés par unité vendue (hypothèse à confirmer).
+- Dette client = ventes à crédit − paiements (calculée, non stockée) ; vente au comptant ne crée pas de dette.
+- Annulation d'une vente : nouvelle `Sale` avec `reverses` pointant vers l'originale (OneToOne).
+- Hasher MD5 rapide uniquement dans `config/settings_test.py` ; `manage.py test` l'active automatiquement, la production garde PBKDF2.
+- `manage.py createmanager <nom> [--pin]` crée le premier gérant (PIN demandé en saisie masquée si absent).
+- Permissions par rôle via `RolePermission` + table `role_actions` par vue ; action non listée = gérant seulement.
+- Produits : lecture pour tous les rôles, écriture (dont prix) gérant seul. Clients : livreur sans accès ; caissier lit/crée/modifie mais ni plafond de crédit ni désactivation.
+- Caissier qui envoie un `credit_limit` différent de la valeur actuelle (0 à la création) → 403 ; renvoyer la même valeur est toléré.
+- Pas de DELETE (405 ; 403 si rôle non autorisé). Désactivation par `POST /{id}/deactivate/` ; `is_active` en lecture seule dans PATCH/PUT ; filtre `?is_active=true|false`.
+- Unités et prix imbriqués dans le produit ; unités identifiées par leur nom ; PATCH avec `units` remplace la liste (unité utilisée par une vente → 400), sans `units` rien ne change.
+- Validation : montants entiers 0..10^12 millimes, `factor` ≥ 1, `consign_qty` > 0 exige `consign_type` et un produit consignable, un seul prix par type de client et par unité.
+- Recherche clients : `?search=` sur nom et téléphone (contient, insensible à la casse).
+- Ventes : toute la logique dans `operations/services.py` (`create_sale`, `cancel_sale`), une seule transaction atomique ; la vue ne fait que valider le format.
+- SQLite en `transaction_mode: IMMEDIATE` : verrou d'écriture dès le début, donc deux ventes simultanées ne peuvent pas passer le même contrôle de stock/crédit.
+- `request_id` (UUID) obligatoire et unique ; un doublon renvoie la vente d'origine (HTTP 200, sans rien recréer), même si le contenu envoyé diffère.
+- Prix, totaux : toujours calculés par le serveur (tarif de l'unité × type du client) ; les champs prix/total envoyés sont ignorés. Client absent = tarif détail.
+- Stock insuffisant : toute la vente est refusée (400, code `insufficient_stock`, produit + demandé + disponible) ; les lignes du même produit sont additionnées en unités de base. Pas de vente à découvert.
+- Erreurs métier : 400 avec `code` stable + `detail` ; les valeurs numériques restent des entiers.
+- Vente de passage (sans client) : comptant uniquement, aucun produit consignable, aucun retour de consigne.
+- Consignes : une ligne de sortie par type et par vente (`consign_qty` × quantité) ; le retour est limité à ce que le client détenait AVANT la vente (les caisses de la vente en cours ne comptent pas).
+- Crédit : exige un client ; plafond 0 = sans limite ; refus si dette + reste à payer > plafond (égalité acceptée) ; contrôle seulement s'il reste un montant impayé, donc une vente entièrement payée passe toujours.
+- `paid_amount` : réservé au crédit, 0 ≤ payé ≤ total ; crée une ligne `Payment` liée à la vente. Une vente comptant ne crée ni paiement ni dette.
+- Dette = Σ totaux des ventes à crédit (annulations incluses, négatives) − Σ paiements ; peut être négative (avance du client).
+- Annulation (gérant) : nouvelle vente de total négatif (`reverses`), lignes en quantités négatives au même prix, stock/consignes/paiements inversés sur de nouvelles lignes. Une fois seulement ; une annulation n'est pas annulable.
+- Annulation refusée (`cancel_consign_conflict`) si elle rendrait le solde de consignes du client négatif (il a déjà rendu les caisses).
+- Vente refusée si client ou produit désactivé.
+- Liste des ventes : plus récentes d'abord, filtres `?client=`, `?date_from=`, `?date_to=` (AAAA-MM-JJ, heure de Tunis) ; ventes en lecture seule via l'API (pas de PUT/PATCH/DELETE).
+- Fiche client : `debt` et `consign_holdings` calculés à la lecture, en lecture seule (calcul par client : à optimiser si les listes deviennent très grandes).
+- Annuler une vente à crédit après des paiements ultérieurs : la dette devient négative (avance du client), sans erreur ni arrondi à 0 ; seuls les paiements faits à la vente (`Payment.at_sale`) sont annulés avec elle, les paiements ultérieurs restent.
+- Dette négative = avance en faveur du client, affichée telle quelle (`debt` < 0) ; elle s'impute sur les ventes à crédit suivantes.
+- Paiements (`POST /api/payments/`) : montant entier > 0 ; `request_id` unique, un doublon renvoie le paiement d'origine (200) sans `warning` ; client obligatoire et actif.
+- Paiement supérieur à la dette : accepté, réponse avec `warning` = `{code: exceeds_debt, debt_before, credit_after}` (`credit_after` = solde créditeur total après le paiement).
+- Paiement lié à une vente (`sale_id`) : la vente doit être à crédit, au même client, ni annulée ni une annulation ; le montant n'est pas limité au reste dû de la vente.
+- Annulation d'un paiement (gérant) : nouvelle ligne de montant négatif avec `reverses`, une seule fois ; une écriture d'annulation n'est pas annulable ; l'annulation de vente saute les paiements déjà annulés (pas de double inversion).
+- Liste des paiements : plus récents d'abord, filtres `?client=`, `?date_from=`, `?date_to=` (même code que les ventes) ; pas de modification ni suppression via l'API.
+- Relevé client (`GET /api/clients/{id}/statement/`, gérant et caissier) : ventes (comptant = variation 0), mouvements de consigne et paiements, triés par date puis vente < consigne < paiement ; chaque ligne porte `debt_delta`, `debt_after` et `consign_after` ; le solde final égale la dette calculée.
+- Consignes manuelles (`POST /api/consignments/`, gérant et caissier) : `direction` out/in, quantité entière ≥ 1, `request_id` idempotent (doublon = mouvement d'origine, 200) ; client obligatoire et actif ; un retour ne peut pas dépasser le solde détenu pour ce type (même code d'erreur que dans les ventes).
+- Pas d'endpoint d'annulation pour les consignes manuelles (hors périmètre) : une erreur se corrige par un mouvement inverse ; jamais de modification.
+- Liste des consignes : mouvements des ventes + manuels, plus récents d'abord, filtres `?client=`, `?type=`, `?date_from=`, `?date_to=` ; lecture et ajout seulement via l'API.
+- Synthèse (`GET /api/consignments/summary/`) : `totals` = détenu par type tous clients confondus (sorties − retours, ventes annulées incluses) ; `overdue` = clients détenant des consignes depuis plus de 30 jours.
+- « Détenu depuis plus de 30 jours » = règle FIFO par client et par type : chaque retour solde d'abord les sorties les plus anciennes encore dues ; une sortie restante est en retard si `maintenant − date > 30 jours` exactement (30 j pile = pas en retard). Les sorties de ventes comptent dans la file.
+- Ligne `overdue` : `held` (total détenu pour ce type), `overdue_quantity` (partie datant de > 30 j), `oldest_since`, `days` ; triée du plus ancien au plus récent.
+- Limite connue (FIFO des consignes) : une erreur de retour corrigée par une « sortie » inverse crée une nouvelle sortie datée d'aujourd'hui, ce qui remet à zéro l'ancienneté de ces caisses dans la liste « en retard » ; à revoir seulement si cela gêne sur le terrain.
+- Stock : toujours la somme des `StockMovement` (unités de base), jamais stocké ; `GET /api/stock/` (tous les rôles, livreur en lecture seule) renvoie par produit `quantity`, `breakdown` (palette/pack/unité selon les facteurs, du plus grand au plus petit), `remainder`, `min_threshold`, `low_stock`.
+- `low_stock` = seuil > 0 ET stock ≤ seuil (égalité compte) ; seuil 0 = jamais d'alerte, même à stock 0.
+- Le détail par unité est renvoyé en données structurées (`unit`, `factor`, `count`), pas en texte : le formatage et la traduction se font dans Flutter. `remainder` = unités de base qui ne forment aucune unité (produit sans unité de facteur 1). Les produits désactivés restent listés avec `is_active`.
+- Entrées de stock (`POST /api/stock/entries/`, gérant) : n'importe quelle unité du produit, convertie en base ; motif `purchase` ; `unit_cost` optionnel = coût par unité saisie (millimes), stocké avec l'unité (`unit`) ; coût par unité de base = `unit_cost / factor` (calcul laissé aux usages futurs) ; `note` optionnelle (200 car.).
+- Ajustements (`POST /api/stock/adjustments/`, gérant) : `reason` obligatoire = `inventory` ou `loss` (stocké dans le mouvement) + `note` libre optionnelle ; exactement un de `counted_quantity` (en unités de base, écart calculé sur le stock au moment de l'appel) ou `delta` signé non nul.
+- Ajustement refusé si : stock compté = stock actuel (`no_change`), perte/casse qui augmente le stock (`loss_must_decrease`), stock qui deviendrait négatif (`adjustment_below_zero`).
+- `request_id` unique sur `StockMovement` (entrées et ajustements) ; un rejeu renvoie le mouvement d'origine (200) avec le stock actuel, sans réévaluer les règles (un inventaire rejoué n'est pas refusé comme « sans changement »).
+- Historique (`GET /api/stock/{product_id}/movements/`, gérant) : plus récent d'abord, avec `balance_after` (stock après chaque mouvement) ; une unité utilisée par une entrée ne peut plus être supprimée du produit.
+- Les vues utilisent `get_object_or_404` de DRF : un identifiant non numérique dans l'URL donne 404, pas 500.
+- Suivi sécurité : expiration du jeton, déconnexion et gestion des utilisateurs sont suivies ; l'expiration du jeton est reportée à la phase 4 (la déconnexion et la gestion des utilisateurs arrivent avec la tâche 7).
+- Utilisateurs (`/api/users/`, gérant seul) : création nom + PIN + rôle ; PATCH `name`/`role`/`is_active` (pas de PUT ni DELETE) ; le PIN ne se change que par `reset-pin` (gérant fixe un nouveau PIN) ou `change-pin` (soi-même).
+- Nom d'utilisateur unique sans tenir compte de la casse (« Sami » et « sami » sont refusés) et nettoyé des espaces ; un utilisateur peut changer la casse de son propre nom.
+- Règles gérants : un gérant ne peut pas se désactiver lui-même (`cannot_deactivate_self`) ; le dernier gérant actif ne peut être ni désactivé ni rétrogradé (`last_manager`, les gérants désactivés ne comptent pas) ; se rétrograder est permis tant qu'un autre gérant actif existe.
+- Désactiver un utilisateur ou réinitialiser son PIN supprime ses jetons (session fermée tout de suite) ; un gérant qui réinitialise son propre PIN garde sa session en cours.
+- `POST /api/auth/logout/` supprime le jeton utilisé (204) : la connexion suivante crée un nouveau jeton. `GET /api/auth/me/` renvoie `id`, `name`, `role` (relus en base) pour restaurer la session.
+- `POST /api/auth/change-pin/` : ancien PIN vérifié (`wrong_pin`), nouveau ≠ ancien (`same_pin`), 4 à 6 chiffres, limité à 5 requêtes/minute par utilisateur ; la session en cours reste valable.
+- `BusinessError` déplacée dans `config/errors.py` (partagée par `accounts` et `operations`).
+- App Flutter (Windows) dans `app/`, structure par fonctionnalité : `core/` (client API, thème, stockage, widgets), `features/{auth,home,sales,clients,consignments,stock,settings}` ; Riverpod 3 pour l'état, dio pour HTTP ; navigation simple (`Navigator`), pas de routeur externe.
+- Client API unique (`core/api/api_client.dart`) : envoie les requêtes, ajoute `Authorization: Token`, traduit statuts et codes de docs/api.md en erreurs typées (`ApiError` : réseau, 401, 403, 404, 429, métier avec `BusinessCode`, validation, serveur) ; aucune logique métier. Un test lit docs/api.md et le backend pour vérifier que tous les codes d'erreur sont connus de l'app et traduits.
+- Un 401 sur une requête authentifiée ferme la session (message « session expirée ») ; un 401 à la connexion est un mauvais PIN, pas une session expirée ; une erreur réseau au démarrage garde le jeton et propose « Réessayer ».
+- Riverpod 3 réessaie seul les providers en erreur : désactivé (`retry: null`) pour ne pas marteler un serveur injoignable.
+- Jeton stocké avec `shared_preferences` et non `flutter_secure_storage` : le plugin Windows de ce dernier se compile avec `atlstr.h` (composant ATL de Visual Studio, facultatif), risque d'échec d'installation chez les gérants ; la base SQLite est sur le même PC, un coffre-fort n'apporte pas de protection réelle. À revoir en phase 4.
+- Test de connexion des Paramètres : `GET /api/auth/me/` sans jeton ; « Edebou » = réponse 401 avec `detail` (docs/api.md n'a pas d'endpoint de santé) ; une réponse 2xx ou un autre statut = « ce n'est pas Edebou ».
+- Langues : `fr` (modèle) et `ar` (droite-à-gauche automatique via `locale`) dans `lib/l10n/*.arb`, bascule enregistrée sur le PC ; aucun texte en dur (un test le vérifie) ; clavier PIN et champ d'adresse restent de gauche à droite en arabe. Traductions arabes à faire relire par un locuteur (vocabulaire : « الحرفاء » pour clients, « العبوات المودعة » pour consignes).
+- Polices : celles de Windows (Segoe UI gère l'arabe) ; aucune police embarquée ni téléchargée (hors ligne).
+- Accueil : modules selon le rôle (gérant et caissier : Caisse, Clients, Consignes, Stock ; livreur : Stock seulement, lecture) ; affichage seulement, le serveur reste seul juge des droits.
+- Thème : bleu profond sur blanc, texte ×1,2, boutons et champs ≥ 64 px, icônes de barre blanches ; un test mesure les contrastes (régression d'icônes gris foncé sur bleu foncé repérée en capture d'écran).
+- Environnement : Visual Studio « Desktop development with C++ » absent de ce PC → `flutter run -d windows` et `flutter build windows` impossibles ici ; `flutter analyze`, `flutter test` et le test contre le vrai serveur fonctionnent. SDK Flutter 3.47.2 réparé (`git restore`) dans `C:\src\flutter`, pas encore dans le PATH.

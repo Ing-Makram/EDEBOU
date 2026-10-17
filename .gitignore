@@ -1,0 +1,15 @@
+# Python / Django (backend/)
+.venv/
+__pycache__/
+*.pyc
+*.sqlite3
+*.sqlite3-journal
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+Thumbs.db
+.DS_Store
+
+# Flutter : app/.gitignore gère build/, .dart_tool/, etc.
